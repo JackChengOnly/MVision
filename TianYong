@@ -1,0 +1,1811 @@
+Option Strict Off
+Option Explicit On
+Imports Cognex.VisionPro
+Imports Cognex.VisionPro.ImageFile
+Imports Cognex.VisionPro.Exceptions
+Imports Cognex.VisionPro.ToolGroup
+Imports System.Object
+Imports System.Runtime
+Imports System.Runtime.Serialization.Formatters.Binary
+Imports System.Net.Sockets
+Imports System.Net
+Imports System.IO
+Imports System.Text
+Imports System.Threading
+Imports System.Reflection
+Imports System.Runtime.CompilerServices
+Imports System.Runtime.InteropServices
+Imports OpcRcw.Comn
+Imports OpcRcw.Da
+Imports System.Diagnostics.Process
+Imports Record_Log.Log_Mes
+Imports INI_dll
+Imports System.Drawing
+Imports System.Drawing.Imaging
+Public Class Form1
+    Implements IOPCDataCallback
+    Public Sub New()
+        MyBase.New()
+        InitializeComponent()
+    End Sub
+    Public mCamera(Triger_Count - 1) As CogAcqFifoTool                   '取像工具数组
+    Private mCamera_Path(Triger_Count - 1) As String                     '取像工具路径
+    Public mToolBlock As CogToolBlock                                    '运行程序
+    Private mToolBlock_Path As String                                    '运行程序路径
+    Public Current_ProductID As String                                    '------------当前料号
+    Public Current_TrigerID As String                                     '------------当前拍照序号
+    Public CCD1_DataArray(0 To 100, 0 To 1) As String                     '胶宽限制
+    Public Count_OK As Integer = 0                                        'OK计数
+    Public Count_Total As Integer = 0                                     '运行总数计数
+    Private Triger_State As Boolean = False                                            '是否拍照  状态位  （触发拍照信号常给）
+#Region "加载"
+    Private Sub Initialize_Check()
+        Try
+            If Dir(Path_Config_Files, vbHidden) = "" Then   '查看配置文件是否存在
+                MessageBox.Show("参数配置不存在，请检查")
+            End If
+            If Dir(Path_Config_VPP, vbDirectory) = "" Then '判断VPP文件夹是否存在   
+                MessageBox.Show("视觉文件不存在")         'MkDir(Path_Config_VPP)                     '创建文件夹         
+            End If
+        Catch ex As Exception
+            Log_WriteStr(ex.ToString & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+        End Try
+        Try
+            Path_SaveImage_OK = Profile_Read_Write.ReadOneString("Save_Path", "Save_ImagePath_OK", Path_Config_Files)
+            Path_SaveImage_NG = Profile_Read_Write.ReadOneString("Save_Path", "Save_ImagePath_NG", Path_Config_Files)
+            Path_Log = Profile_Read_Write.ReadOneString("Save_Path", "Path_Log", Path_Config_Files)
+            Path_Err = Profile_Read_Write.ReadOneString("Save_Path", "Path_Err", Path_Config_Files)
+            Program_Name.Text = Profile_Read_Write.ReadOneString("Program", "Name", Path_Config_Files)
+        Catch ex As Exception
+            MessageBox.Show("保存(图片及Log) 路径加载失败，请检查配置文件！！！", "警告：", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        End Try
+        Try
+            PassWord(0) = Profile_Read_Write.ReadOneString("PassWord", "作业员", Path_Config_Files)
+            PassWord(1) = Profile_Read_Write.ReadOneString("PassWord", "管理员", Path_Config_Files)
+            PassWord(2) = Profile_Read_Write.ReadOneString("PassWord", "程序员", Path_Config_Files)
+            UpdateTextbox(TextBox_passworld1, PassWord(0))
+            UpdateTextbox(TextBox_passworld2, PassWord(1))
+            UpdateTextbox(TextBox_passworld3, PassWord(2))
+        Catch ex As Exception
+            MessageBox.Show("用户密码参数加载失败，请检查配置文件！！！", "警告：", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        End Try
+        '---------------------------------拼图参数加载---------------------------------------
+        Try
+            For i As Integer = 0 To 7 Step 1
+                Images_X(i) = CDbl(Split(Profile_Read_Write.ReadOneString("StitchImageData", "ImagesXY" & CStr(i + 1), Path_Config_Files), "&")(0))
+                Images_Y(i) = CDbl(Split(Profile_Read_Write.ReadOneString("StitchImageData", "ImagesXY" & CStr(i + 1), Path_Config_Files), "&")(1))
+                ImageIndex(i) = CInt(Split(Profile_Read_Write.ReadOneString("StitchImageData", "ImagesXY" & CStr(i + 1), Path_Config_Files), "&")(2))
+            Next
+            Image_Width = CDbl(Profile_Read_Write.ReadOneString("StitchImageData", "Imagewidth", Path_Config_Files))
+            Image_Hight = CDbl(Profile_Read_Write.ReadOneString("StitchImageData", "Imagehight", Path_Config_Files))
+        Catch ex As Exception
+            MessageBox.Show("-拼图参数加载失败，请检查配置文件！！！", "警告：", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        End Try
+        Application.DoEvents()
+    End Sub
+    Private Sub Form1_Load(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles MyBase.Load
+        Try
+            If UBound(Diagnostics.Process.GetProcessesByName( _
+                      Diagnostics.Process.GetCurrentProcess.ProcessName)) > 0 Then
+                MessageBox.Show("当前版本的应用程序不允许重复运行 ！  ", "禁止运行", MessageBoxButtons.OK, MessageBoxIcon.Error)
+                Application.Exit()
+            End If
+            Control.CheckForIllegalCrossThreadCalls = False
+            Form_show()             '界面显示
+            checklicense()          '检测加密狗
+            Initialize_Check()      '参数加载
+            ReadProductName()       '料号读取
+            Thread.Sleep(200)
+            Start_Sample()
+            Reset_Camera(False)          '复位相机拍照信号
+            chkGroupActive.Checked = True
+            Thread.Sleep(500)
+            Ready.Enabled = True
+
+
+        Catch ex As Exception
+            MessageBox.Show("加载失败")
+            Application.Exit()
+        End Try
+        CCD_Ready(True)
+    End Sub
+#End Region
+#Region "关闭"
+    Private Sub Frm_Main_FormClosing(ByVal sender As System.Object, ByVal e As System.Windows.Forms.FormClosingEventArgs) Handles MyBase.FormClosing
+        Try
+            If MessageBox.Show("确定要退出 工具设置 界面 吗？", "提示信息", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) = Windows.Forms.DialogResult.OK Then
+                Save_CCD_Data()
+                Stop_Sample()
+                CogRecordDisplay1.Dispose()
+                GC.Collect()
+                GetCurrentProcess.Kill()
+                'System.Diagnostics.Process.GetCurrentProcess.Kill()
+                'Application.Exit()
+            Else
+                e.Cancel = True
+            End If
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+#End Region
+#Region "功能"
+#Region "切换显示"
+    Private Sub Form_show()
+        TabControl1.SelectTab(0)
+        TabPage_liaohao.Parent = Nothing
+        TabPage_xiangji.Parent = Nothing
+        TabPage_jiaozheng.Parent = Nothing
+        TabPage_biaozhun.Parent = Nothing
+        TabPage_canshu.Parent = Nothing
+        TabPage_jiance.Parent = Nothing
+        ShowTSMI_btn.Visible = True        ''''''显示
+        PasswordTSMI_btn.Visible = False    ''''''密码
+        LogTMSI_btn.Visible = True         ''''''日志
+
+        PartNumTSMI_btn.Visible = False    ''''''料号
+        wu.Visible = False                 ''''''校正
+        StanderTSMI_btn.Visible = False    ''''''标准
+        ParameterTSMI_btn.Visible = False ''''''参数
+
+        CamerasTSMI_btn.Visible = False    ''''''相机
+        InspectTSMI_btn.Visible = False    ''''''检测
+        ConnetTSMI_btn.Visible = False   ''''''通讯
+        SaveTSMI_btn.Visible = False       ''''''保存
+    End Sub
+    Private Sub ShowTSMI_btn_Click(ByVal sender As Object, ByVal e As EventArgs) Handles ShowTSMI_btn.Click
+        Try
+            TabControl1.SelectedTab = TabPage_xianshi
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Private Sub LogTMSI_btn_Click(ByVal sender As Object, ByVal e As EventArgs) Handles LogTMSI_btn.Click
+        Try
+            TabControl1.SelectedTab = TabPage_rizhi
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Private Sub CamerasTSMI_btn_Click(ByVal sender As Object, ByVal e As EventArgs) Handles CamerasTSMI_btn.Click
+        Try
+            If MessageBox.Show("确定要相机设置 界面 吗？ 非专业人士请勿操作！", "提示信息", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) = Windows.Forms.DialogResult.OK Then
+                If CInt(TextBox_TrigerID.Text) >= 1 And CInt(TextBox_TrigerID.Text) <= 8 Then
+                    Dim Form_Camera As New Camera(mCamera(CInt(TextBox_TrigerID.Text) - 1), mCamera_Path(CInt(TextBox_TrigerID.Text) - 1))
+                    Form_Camera.ShowDialog()
+                    Form_Camera.Close()
+                Else
+                    MessageBox.Show("请核实当前位置是否正确")
+                End If
+            End If
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Private Sub CalibTSMI_btn_Click(ByVal sender As Object, ByVal e As EventArgs) Handles wu.Click
+        Try
+            TabControl1.SelectedTab = TabPage_jiaozheng
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Private Sub StanderTSMI_btn_Click(ByVal sender As Object, ByVal e As EventArgs) Handles StanderTSMI_btn.Click
+        Try
+            TabControl1.SelectedTab = TabPage_biaozhun
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Private Sub InspectTSMI_btn_Click(ByVal sender As Object, ByVal e As EventArgs) Handles InspectTSMI_btn.Click
+        Try
+            If MessageBox.Show("确定要打开 检测工具 界面 吗？ 非专业人士请勿操作！", "提示信息", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) = Windows.Forms.DialogResult.OK Then
+                Dim Form_Toolblock As New ToolBlock(mToolBlock, CDbl(CCD1_DataArray(1, 1)), CDbl(CCD1_DataArray(2, 1)), CDbl(CCD1_DataArray(3, 1)))
+                Form_Toolblock.ShowDialog()
+                Form_Toolblock.Close()
+            Else
+            End If
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Private Sub ConnetTSMI_btn_Click(ByVal sender As Object, ByVal e As EventArgs) Handles ConnetTSMI_btn.Click
+        Try
+            TabControl1.SelectedTab = TabPage_tongxun
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Private Sub ParameterTSMI_btn_Click(ByVal sender As Object, ByVal e As EventArgs) Handles ParameterTSMI_btn.Click
+        Try
+            'TabControl1.SelectedTab = TabPage_canshu
+            Dim form As New StitchImage_F()
+            form.Show()
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Private Sub PartNumTSMI_btn_Click(ByVal sender As Object, ByVal e As EventArgs) Handles PartNumTSMI_btn.Click
+        Try
+            TabControl1.SelectedTab = TabPage_liaohao
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Private Sub PasswordTSMI_btn_Click(ByVal sender As Object, ByVal e As EventArgs) Handles PasswordTSMI_btn.Click
+        Try
+            ComboBox_Admin.SelectedIndex = 0
+            TabControl1.SelectedTab = TabPage_mima
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Private Sub SaveTSMI_btn_Click(ByVal sender As Object, ByVal e As EventArgs) Handles SaveTSMI_btn.Click
+        Try
+            If MessageBox.Show("确定要保存 相机VPP 吗？", "提示信息", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) = Windows.Forms.DialogResult.OK Then
+                'CogSerializer.SaveObjectToFile(mCamera(CInt(TextBox_TrigerID.Text)), mCamera_Path(CInt(TextBox_TrigerID.Text)), GetType(BinaryFormatter), CogSerializationOptionsConstants.Minimum)
+                CogSerializer.SaveObjectToFile(mToolBlock, mToolBlock_Path, GetType(BinaryFormatter), CogSerializationOptionsConstants.Minimum)
+                Save_CCD_Data()
+                MessageBox.Show("保存VPP成功")
+            End If
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+#End Region
+#Region "时钟"
+    Private Sub Ready_Tick(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Ready.Tick
+        Try
+            If State_CameraReady = False Then
+                Write_value(1, 1)
+                State_CameraReady = True
+            Else
+               
+            End If
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Private Sub TimeStart()
+        Try
+            ReadOPC.Enabled = True
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Private Sub TimeStop()
+        Try
+            ReadOPC.Enabled = False
+            ReadOPC.Stop()
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Private Sub ReadOPC_Tick(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles ReadOPC.Tick
+        Try
+            'Read_value()
+            TrigerIndex = triggerNum + 1
+            UpdateTextbox(TextBox_TrigerID, TrigerIndex)   '当前拍照序号
+            If TrigerIndex <> "0" Then
+                Dim thread As New Thread(AddressOf SZM_Run)
+                thread.Start(TrigerIndex)
+            End If
+        Catch ex As Exception
+            Log_WriteStr("Read OPC Error" & vbCrLf & ex.ToString & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+        End Try
+    End Sub
+#End Region
+#Region "用户"
+#Region "注销"
+    Private Sub Btn_Exit_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Btn_Exit.Click
+        ParameterTSMI_btn.Visible = False
+        'InspectTSMI_btn.Enabled = False
+        'SaveTSMI_btn.Enabled = False
+        'ConnetTSMI_btn.Enabled = False
+        'CamerasTSMI_btn.Enabled = False
+        GroupBox_passworld.Visible = False
+        CamerasTSMI_btn.Visible = False    ''''''相机
+        InspectTSMI_btn.Visible = False    ''''''检测
+        ConnetTSMI_btn.Visible = False   ''''''通讯
+        SaveTSMI_btn.Visible = False       ''''''保存
+        Command_Start.Enabled = False
+        ForceOK.Enabled = False
+        TextBox_passworld.Clear()
+    End Sub
+#End Region
+#Region "登录"
+    Private Sub Btn_LogIN_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Btn_LogIN.Click
+        If ComboBox_Admin.Text = "作业员" And TextBox_passworld.Text = PassWord(0) Then
+            'CCD_set.Enabled = True
+            CamerasTSMI_btn.Visible = True    ''''''相机
+            ForceOK.Enabled = True
+            MessageBox.Show(ComboBox_Admin.Text & "登录成功！", "系统提示:", MessageBoxButtons.OK)
+            TextBox_passworld.Clear()
+        ElseIf ComboBox_Admin.Text = "管理员" And TextBox_passworld.Text = PassWord(1) Then
+            ParameterTSMI_btn.Enabled = True
+            InspectTSMI_btn.Enabled = True
+            ConnetTSMI_btn.Enabled = True
+            CamerasTSMI_btn.Enabled = True
+            'CCD_set.Enabled = True
+            CamerasTSMI_btn.Visible = True   ''''''相机
+            InspectTSMI_btn.Visible = True    ''''''检测
+            SaveTSMI_btn.Visible = True       ''''''保存
+            ParameterTSMI_btn.Visible = True
+            Command_Start.Enabled = True
+            ForceOK.Enabled = True
+            MessageBox.Show(ComboBox_Admin.Text & "登录成功！", "系统提示:", MessageBoxButtons.OK)
+            TextBox_passworld.Clear()
+        ElseIf ComboBox_Admin.Text = "程序员" And TextBox_passworld.Text = PassWord(2) Then
+            ParameterTSMI_btn.Enabled = True
+            InspectTSMI_btn.Enabled = True
+            SaveTSMI_btn.Enabled = True
+            'CCD_set.Enabled = True
+            Command_Start.Enabled = True
+            GroupBox_passworld.Visible = True  ''''''修改密码
+            CamerasTSMI_btn.Visible = True    ''''''相机
+            ParameterTSMI_btn.Visible = True
+            InspectTSMI_btn.Visible = True    ''''''检测
+            ConnetTSMI_btn.Visible = True  ''''''通讯
+            ParameterTSMI_btn.Visible = True
+            SaveTSMI_btn.Visible = True       ''''''保存
+            ForceOK.Enabled = True
+            MessageBox.Show(ComboBox_Admin.Text & "登录成功！", "系统提示:", MessageBoxButtons.OK)
+            TextBox_passworld.Clear()
+        Else
+            MessageBox.Show(ComboBox_Admin.Text & "登录失败，请重新输入密码！", "系统提示:", MessageBoxButtons.OK)
+            TextBox_passworld.Clear()
+        End If
+        'TabControl1.SelectedTab = TabPage_xianshi
+    End Sub
+#End Region
+#Region "修改密码"
+    Private Sub Button_passworld_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Button_passworld.Click
+        Try
+            PassWord(0) = TextBox_passworld1.Text
+            PassWord(1) = TextBox_passworld2.Text
+            PassWord(2) = TextBox_passworld3.Text
+            Profile_Read_Write.WriteOneString("PassWord", "作业员", PassWord(0), Path_Config_Files)
+            Profile_Read_Write.WriteOneString("PassWord", "管理员", PassWord(1), Path_Config_Files)
+            Profile_Read_Write.WriteOneString("PassWord", "程序员", PassWord(2), Path_Config_Files)
+            MessageBox.Show("密码修改成功！请重新登录", "系统提示:", MessageBoxButtons.OK, MessageBoxIcon.Information)
+            Btn_Exit.PerformClick()                   '------------ Btn_Exit按钮点击事件-----------------
+        Catch ex As Exception
+            Log_WriteStr(ex.ToString & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+        End Try
+    End Sub
+#End Region
+#End Region
+#Region "在线/离线"
+    Private Sub CCD_Start_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles CCD_Start.Click
+        Try
+            If CCD_Start.Text = "在线" Then
+                TextBox_TrigerID.Text = "1"
+
+                Ready.Enabled = False
+                CCD_set.Enabled = True
+                PasswordTSMI_btn.Visible = True
+                ComboBox_ProductID.Enabled = True
+                TextBox_TrigerID.Enabled = True
+                chkGroupActive.Checked = False
+                CCD_Start.Text = "离线"
+                CCD_Start.BackColor = Color.Red
+                Command_Start.Enabled = True
+            Else
+                If activeGroup = False Then
+                    Start_Sample()
+                End If
+                ForceOK.Enabled = False
+
+                Ready.Enabled = True
+                CCD_set.Enabled = False
+                PasswordTSMI_btn.Visible = False
+                GroupBox_passworld.Visible = False
+                CamerasTSMI_btn.Visible = False    ''''''相机
+                InspectTSMI_btn.Visible = False    ''''''检测
+                ConnetTSMI_btn.Visible = False   ''''''通讯
+                SaveTSMI_btn.Visible = False       ''''''保存
+                TextBox_passworld.Clear()
+                ComboBox_ProductID.Enabled = False
+                TextBox_TrigerID.Enabled = False
+                CCD_Start.Text = "在线"
+                CCD_Start.BackColor = Color.Green
+                chkGroupActive.Checked = True
+                Command_Start.Enabled = False
+                TextBox_TrigerID.Text = "0"
+            End If
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+#End Region
+#End Region
+#Region "检测加密狗"
+    Delegate Sub mydelegate()
+    Dim LicensedFeatures As New CogStringCollection
+    Public Sub checklicense()
+        Try
+            If InvokeRequired Then
+                Dim mydel As New mydelegate(AddressOf checklicense)
+                Invoke(mydel)
+                Return
+            End If
+            LicensedFeatures = CogMisc.GetLicensedFeatures(False)
+            If LicensedFeatures.Count > 0 Then
+            Else
+                MessageBox.Show("请检查加密狗")
+                Dim s() As System.Diagnostics.Process
+                s = System.Diagnostics.Process.GetProcessesByName("MVision.vshost")
+                System.Diagnostics.Process.GetCurrentProcess.Kill()
+            End If
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+#End Region
+#Region "作业加载"
+    Private Sub VPP_Load()
+        Try
+            For i As Integer = 0 To (Triger_Count - 1) Step 1
+                mCamera_Path(i) = Path_Config_VPP & "\" & Current_ProductID & "\Camera_" & i & ".vpp"
+                mCamera(i) = CType(CogSerializer.LoadObjectFromFile(mCamera_Path(i)), CogAcqFifoTool)
+            Next
+            mToolBlock_Path = Path_Config_VPP & "\" & Current_ProductID & "\Toolblock.vpp"
+            mToolBlock = CType(CogSerializer.LoadObjectFromFile(mToolBlock_Path), CogToolBlock)
+            AddHandler mToolBlock.Ran, AddressOf TB1_Ran
+            Read_CCD_Data()
+            Log_WriteStr("料号加载成功" & vbCrLf, Color.Green, RTBox_Log, Path_Log)
+            '----------------------------------------------------------------------
+        Catch ex As Exception
+            Log_WriteStr("VPP加载失败" & vbCrLf & ex.ToString & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+        End Try
+    End Sub
+#End Region
+#Region "检测"
+#Region "运行结果"
+
+    Delegate Sub CCDRunDel(ByVal i As Integer)
+    Private Sub CCD_Run(ByVal i As Integer)
+        Triger_State = True
+        Try
+
+            If InvokeRequired Then
+                Dim mydel As New CCDRunDel(AddressOf CCD_Run)
+                mydel.Invoke(i)
+                Return
+            End If
+
+            Select Case i
+                Case 1
+                    CogRecordDisplay1.StaticGraphics.Clear()
+                    CogRecordDisplay1.InteractiveGraphics.Clear()
+                    mCamera(i - 1).Run()
+                    If mCamera(i - 1).RunStatus.Result <> CogToolResultConstants.Accept Then
+                        Log_WriteStr(mCamera(i).RunStatus.Message & vbCrLf & "第" & i & "次取像失败" & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+                        Write_value(False, 2)                  '-----------------相机故障
+                        CCD_Result(False)                 '检测结果不合格
+                        Exit Sub
+                    End If
+                    ImagesF(i - 1) = mCamera(i - 1).OutputImage
+                    CogRecordDisplay1.Image = ImagesF(i - 1)
+                    CogRecordDisplay1.Fit(True)
+                    Save_Image()
+                    Exit Sub                                '退出拍照
+                Case 2
+                    mCamera(i - 1).Run()
+                    If mCamera(i - 1).RunStatus.Result <> CogToolResultConstants.Accept Then
+                        Log_WriteStr(mCamera(i - 1).RunStatus.Message & vbCrLf & "第" & i & "次取像失败" & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+                        Write_value(False, 2)                '-----------------相机故障
+                        CCD_Result(False)                 '检测结果不合格
+                        Exit Sub
+                    End If
+                    ImagesF(i - 1) = mCamera(i - 1).OutputImage
+                    CogRecordDisplay1.Image = ImagesF(i - 1)
+                    CogRecordDisplay1.Fit(True)
+                    Save_Image()
+                    Exit Sub                                '退出拍照
+                Case 3
+                    mCamera(i - 1).Run()
+                    If mCamera(i - 1).RunStatus.Result <> CogToolResultConstants.Accept Then
+                        Log_WriteStr(mCamera(i - 1).RunStatus.Message & vbCrLf & "第" & i & "次取像失败" & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+                        Write_value(False, 2)               '-----------------相机故障
+                        CCD_Result(False)                 '检测结果不合格
+                        Exit Sub
+                    End If
+                    ImagesF(i - 1) = mCamera(i - 1).OutputImage
+                    CogRecordDisplay1.Image = ImagesF(i - 1)
+                    CogRecordDisplay1.Fit(True)
+                    Save_Image()
+                    Exit Sub                                '退出拍照
+                Case 4
+                    mCamera(i - 1).Run()
+                    If mCamera(i - 1).RunStatus.Result <> CogToolResultConstants.Accept Then
+                        Log_WriteStr(mCamera(i - 1).RunStatus.Message & vbCrLf & "第" & i & "次取像失败" & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+                        Write_value(False, 2)              '-----------------相机故障
+                        CCD_Result(False) '检测结果不合格
+                        Exit Sub
+                    End If
+                    ImagesF(i - 1) = mCamera(i - 1).OutputImage
+                    CogRecordDisplay1.Image = ImagesF(i - 1)
+                    CogRecordDisplay1.Fit(True)
+                    Save_Image()
+                    Exit Sub                               '退出拍照
+                Case 5
+                    mCamera(i - 1).Run()
+                    If mCamera(i - 1).RunStatus.Result <> CogToolResultConstants.Accept Then
+                        Log_WriteStr(mCamera(i - 1).RunStatus.Message & vbCrLf & "第" & i & "次取像失败" & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+                        Write_value(False, 2)              '-----------------相机故障
+                        CCD_Result(False)                 '检测结果不合格
+                        Exit Sub
+                    End If
+                    ImagesF(i - 1) = mCamera(i - 1).OutputImage
+                    CogRecordDisplay1.Image = ImagesF(i - 1)
+                    CogRecordDisplay1.Fit(True)
+                    Save_Image()
+                    'CCD_Result(True)                      '当前拍照完成OK
+                    'CCD_Ready(True)                       '相机准备完成OK
+                    Exit Sub                              '退出拍照
+                Case 6
+                    mCamera(i - 1).Run()
+                    If mCamera(i - 1).RunStatus.Result <> CogToolResultConstants.Accept Then
+                        Log_WriteStr(mCamera(i - 1).RunStatus.Message & vbCrLf & "第" & i & "次取像失败" & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+                        Write_value(False, 2)              '-----------------相机故障
+                        CCD_Result(False)                 '检测结果不合格
+                        Exit Sub
+                    End If
+                    ImagesF(i - 1) = mCamera(i - 1).OutputImage
+                    CogRecordDisplay1.Image = ImagesF(i - 1)
+                    CogRecordDisplay1.Fit(True)
+                    Save_Image()
+                    Exit Sub                             '退出拍照
+                Case 7
+                    mCamera(i - 1).Run()
+                    If mCamera(i - 1).RunStatus.Result <> CogToolResultConstants.Accept Then
+                        Log_WriteStr(mCamera(i - 1).RunStatus.Message & vbCrLf & "第" & i & "次取像失败" & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+                        Write_value(False, 2)             '-----------------相机故障
+                        CCD_Result(False)                 '检测结果不合格
+                        Exit Sub
+                    End If
+                    ImagesF(i - 1) = mCamera(i - 1).OutputImage
+                    CogRecordDisplay1.Image = ImagesF(i - 1)
+                    CogRecordDisplay1.Fit(True)
+                    Save_Image()
+                    Exit Sub        '退出拍照
+                Case 8
+                    If Triger_State = True Then
+                        mCamera(i - 1).Run()
+                        If mCamera(i - 1).RunStatus.Result <> CogToolResultConstants.Accept Then
+                            Log_WriteStr(mCamera(i - 1).RunStatus.Message & vbCrLf & "第" & i & "次取像失败" & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+                            Write_value(False, 2)       '-----------------相机故障
+                            CCD_Result(False)                 '检测结果不合格
+                            Exit Sub
+                        End If
+                        ImagesF(i - 1) = mCamera(i - 1).OutputImage
+                        CogRecordDisplay1.Image = ImagesF(i - 1)
+                        CogRecordDisplay1.Fit(True)
+                        Save_Image()
+                        For j As Integer = 0 To (Triger_Count - 1)
+                            If ImagesF(j) Is Nothing Then
+                                Log_WriteStr("第" & j & "次取像异常请检查！", Color.Red, RTBox_Log, Path_Log)
+                            Else
+                                'mToolBlock.Inputs.Item("Input" & CStr(j)).Value = Images(j)
+                            End If
+                        Next
+
+                        mToolBlock.Inputs.Item("Input").Value = StitchImage(Image_Width, Image_Hight, i, Images_X, Images_Y, ImageIndex, ImagesF)
+                        mToolBlock.Run()
+                        If Label_Result.BackColor = Color.Green Then
+                            Count_OK += 1
+                            CCD_Count(True)
+                            If isSaveImage = True Then
+                                Save_OK_Image(mToolBlock.Inputs.Item("Input").Value)
+                            End If
+                        Else
+                            CCD_Count(False)
+                            If isSaveImage = True Then
+                                Save_NG_Image(mToolBlock.Inputs.Item("Input").Value)
+                            End If
+                        End If
+                        Count_Total += 1
+                        UpdateTextbox(TextBox_Total, Count_Total)
+                        UpdateTextbox(TextBox_OK, Count_OK)
+                        UpdateTextbox(TextBox_NG, Count_Total - Count_OK)
+                        If Count_Total = 0 Then
+                            UpdateTextbox(TextBox_Pass_, "0")
+                        Else
+                            UpdateTextbox(TextBox_Pass_, FormatNumber(100 * Count_OK / Count_Total, 2))
+                        End If
+                    End If
+                    Save_CCD_Data()
+                    Triger_State = False
+                Case Else
+                    Log_WriteStr("请检查当前拍照位置序号。", Color.Red, RTBox_Log, Path_Log)
+            End Select
+        Catch ex As Exception
+            Triger_State = False
+            MessageBox.Show(ex.ToString)
+        End Try
+        Triger_State = False
+    End Sub
+    Private Sub TB1_Ran()
+        Dim topRecord As Cognex.VisionPro.ICogRecord
+        CogRecordDisplay1.InteractiveGraphics.Clear()
+        If mToolBlock.RunStatus.Result = CogToolResultConstants.Accept Then
+            topRecord = mToolBlock.CreateLastRunRecord.SubRecords("CogPMAlignTool1.InputImage")
+            CogRecordDisplay1.Record = topRecord
+            CogRecordDisplay1.Fit(True)
+            If mToolBlock.Outputs.Item("Result").Value = True Then
+                Label_Result.BackColor = Color.Green
+            Else
+                Label_Result.BackColor = Color.Red
+            End If
+        Else
+            topRecord = mToolBlock.CreateLastRunRecord.SubRecords("CogPMAlignTool1.InputImage")
+            CogRecordDisplay1.Record = topRecord
+            CogRecordDisplay1.Fit(True)
+            Label_Result.BackColor = Color.Red
+        End If
+        Log_WriteStr("CCD1_RUN" & vbCrLf, Color.Green, RTBox_Log, Path_Log)
+    End Sub
+    Private Sub CCD_Result(ByVal State As Boolean)                 '相机检测结果
+        If Result_OK = True Then
+            Write_value(True, 9)                      '检测合格结果
+            Thread.Sleep(50)
+            Write_value(False, 10)
+        Else
+            If State = True Then
+                Write_value(True, 9)
+                Thread.Sleep(50)
+                Write_value(False, 10)
+            Else
+                Write_value(True, 10)
+                Thread.Sleep(50)
+                Write_value(False, 9)
+            End If
+        End If
+    End Sub
+    Private Sub PC_PLCSend(ByVal State As Boolean)
+        Write_value(State, 6)
+    End Sub                                        '------------发送缸体编号到PLC完成信号
+    Private Sub PLC_PCRecive(ByVal State As Boolean)
+        Write_value(State, 4)
+    End Sub                                        '------------PC接收缸体编号完成信号
+    Private Sub CCD_Ready(ByVal State As Boolean)
+        Write_value(State, 1)
+    End Sub                                        '---------------相机准备好信号
+    Private Sub Reset_Camera(ByVal State As Boolean)
+        Write_value(State, 8)
+    End Sub                                             '---------------复位拍照信号
+    Private Sub CCD_Count(ByVal FinalResult As Boolean)
+        If ForceOK.Enabled = True Then
+            CCD_Result(True)
+        Else
+            CCD_Result(FinalResult)
+        End If
+        Thread.Sleep(500)
+        Log_WriteStr("CCD_Complete" & vbCrLf, Color.Green, RTBox_Log, Path_Log)
+        CCD_Ready(True)                                                          '---------------相机准备好
+    End Sub
+#End Region
+#End Region
+#Region "料号加载"
+    Public Sub ReadProductName()
+        Try
+            If Directory.Exists(Path_Config_VPP) Then
+                Dim ProductPathName() As String = Directory.GetDirectories(Path_Config_VPP) '\Inspect
+                ComboBox_ProductID.Items.Clear()
+                For i = 0 To ProductPathName.Length - 1
+                    Dim ProductName As String = Replace(ProductPathName(i), Path_Config_VPP & "\", "")
+                    ComboBox_ProductID.Items.Add(ProductName)
+                Next
+                Log_WriteStr("料号读取成功。" & vbCrLf, Color.Green, RTBox_Log, Path_Log)
+            Else
+                MessageBox.Show("料号文件丢失，请检查！！！", "系统提示：", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                Application.Exit()
+            End If
+            Current_ProductID = Profile_Read_Write.ReadOneString("LastRun", "ProductID", Path_Config_Files)
+            ComboBox_ProductID.Text = Current_ProductID
+        Catch ex As Exception
+            Log_WriteStr(ex.ToString & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+        End Try
+    End Sub
+#End Region
+#Region "数据读写"
+#Region "参数读取"
+    Public Sub Read_CCD_Data()
+        Try
+           '---------------------当前料号配置文件--------------------------------
+            Dim fname As String = Path_Config_VPP & "\" & ComboBox_ProductID.Text & "\Camera.txt"
+            CCD1_DataArray(1, 1) = Profile_Read_Write.ReadOneString("CCD", "Width", fname)
+            CCD1_DataArray(2, 1) = Profile_Read_Write.ReadOneString("CCD", "Up", fname)
+            CCD1_DataArray(3, 1) = Profile_Read_Write.ReadOneString("CCD", "Down", fname)
+            Count_OK = CInt(Profile_Read_Write.ReadOneString("CCD", "Count_OK", fname))
+            Count_Total = CInt(Profile_Read_Write.ReadOneString("CCD", "Count_Total", fname))
+
+            TextBox_Total.Text = Count_Total
+            TextBox_OK.Text = Count_OK
+            TextBox_NG.Text = Count_Total - Count_OK
+            If Count_Total = 0 Then
+                TextBox_Pass_.Text = "0"
+            Else
+                TextBox_Pass_.Text = FormatNumber(100 * Count_OK / Count_Total, 2)
+            End If
+            Log_WriteStr("Camera" & ComboBox_ProductID.Text & "参数获取成功" & vbCrLf, Color.Green, RTBox_Log, Path_Log)
+        Catch ex As Exception
+            Log_WriteStr(ex.ToString & vbCrLf, Color.Red, RTBox_Err, Path_Err)
+        End Try
+    End Sub
+#End Region
+#Region "参数设置---保存"
+    Private Sub Save_CCD_Data()
+        Try
+            '-------------------------------路径------------------------
+            Profile_Read_Write.WriteOneString("Save_Path", "Save_ImagePath_OK", Path_SaveImage_OK, Path_Config_Files)
+            Profile_Read_Write.WriteOneString("Save_Path", "Save_ImagePath_NG", Path_SaveImage_NG, Path_Config_Files)
+            Profile_Read_Write.WriteOneString("Save_Path", "Path_Log", Path_Log, Path_Config_Files)
+            Profile_Read_Write.WriteOneString("Save_Path", "Path_Err", Path_Err, Path_Config_Files)
+            '-------------------密码-----------------------------------
+            Profile_Read_Write.WriteOneString("PassWord", "作业员", PassWord(0), Path_Config_Files)
+            Profile_Read_Write.WriteOneString("PassWord", "管理员", PassWord(1), Path_Config_Files)
+            Profile_Read_Write.WriteOneString("PassWord", "程序员", PassWord(2), Path_Config_Files)
+            '---------------------当前料号配置文件--------------------------------
+            Dim fname As String = Path_Config_VPP & "\" & Current_ProductID & "\Camera.txt"
+            Profile_Read_Write.WriteOneString("CCD", "Width", CCD1_DataArray(1, 1), fname)
+            Profile_Read_Write.WriteOneString("CCD", "Up", CCD1_DataArray(2, 1), fname)
+            Profile_Read_Write.WriteOneString("CCD", "Down", CCD1_DataArray(3, 1), fname)
+            Profile_Read_Write.WriteOneString("CCD", "Count_OK", Count_OK, fname)
+            Profile_Read_Write.WriteOneString("CCD", "Count_Total", Count_Total, fname)
+            '---------------------------------------------------
+            Profile_Read_Write.WriteOneString("LastRun", "ProductID", ComboBox_ProductID.Text, Path_Config_Files)
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+#End Region
+#End Region
+#Region "OPC"
+    Dim m_server As IOPCServer = Nothing
+    Dim m_group As IOPCGroupStateMgt = Nothing
+    Dim m_item As IOPCItemMgt = Nothing
+    Dim m_asyncIO2 As IOPCAsyncIO2 = Nothing
+
+    Dim m_ConnectionContainer As IConnectionPointContainer = Nothing
+    Dim m_ConnectionPoint As IConnectionPoint = Nothing
+    Dim m_Callback As IOPCDataCallback = Nothing
+    Dim m_dwCookie As Int32 = 0
+
+    'Used by GetErrorString; Language code &H409 = ENGLISH
+    Const LOCALE_ID As Integer = &H409
+
+    Dim Transaction As Integer = 0
+    Dim ServerGroup As Integer = 0
+    Dim ClientGrouphandle As Integer = 0
+    Dim ServerHandle(MessCount) As Integer
+    'Dim ServerHandle1 As Integer = 0
+    'Dim ServerHandle2 As Integer = 0
+    'Dim ServerHandle3 As Integer = 0
+    'Dim ServerHandle4 As Integer = 0
+    'Dim ServerHandle5 As Integer = 0
+    'Dim ServerHandle6 As Integer = 0
+    'Dim ServerHandle7 As Integer = 0
+    'Dim ServerHandle8 As Integer = 0
+    'Dim ServerHandle9 As Integer = 0
+    'Dim ServerHandle10 As Integer = 0
+
+    Dim activeGroup As Boolean = False
+    Dim OutText As String
+    Private Sub Command_Start_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Command_Start.Click
+        Start_Sample()
+    End Sub
+    Private Sub Command_Read_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Command_Read.Click
+        Read_value()
+    End Sub
+    Private Sub Command_Write_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Command_Write.Click
+        Write_value(Edit_WriteVal.Text, (ComboBox_PLCPointID.SelectedIndex + 1))
+        chkGroupActive.Checked = True
+    End Sub
+    Private Sub Command_Exit_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Command_Exit.Click
+        Stop_Sample()
+    End Sub
+    Private Sub chkGroupActive_CheckedChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles chkGroupActive.CheckedChanged
+        Dim RequestedUpdateRate As Integer = 250
+        Dim Active As Integer = 0
+        Dim Loc As Integer = &H409
+
+        Dim pTimeBias As IntPtr = IntPtr.Zero
+        Dim pDeadband As IntPtr = IntPtr.Zero
+        'Dim phServerGroup As IntPtr = IntPtr.Zero
+
+        'Dim hServerGroup As Integer
+        Dim RevisedUpdateRate As Integer
+
+        ' Access unmanaged memory
+        Dim hRequestedUpdateRate As GCHandle = GCHandle.Alloc(RequestedUpdateRate, GCHandleType.Pinned)
+        Dim hLoc As GCHandle = GCHandle.Alloc(Loc, GCHandleType.Pinned)
+        Dim hActive As GCHandle = GCHandle.Alloc(Active, GCHandleType.Pinned)
+        Dim hClientGroup As GCHandle = GCHandle.Alloc(ClientGrouphandle, GCHandleType.Pinned)
+        Dim OutText As String
+        Try
+            OutText = "Group active checked"
+            If Not activeGroup Then
+                ' Activate group
+                activeGroup = True
+                hActive.Target = 1
+                m_group.SetState(hRequestedUpdateRate.AddrOfPinnedObject(), _
+                                   RevisedUpdateRate, _
+                                   hActive.AddrOfPinnedObject(), _
+                                   pTimeBias, _
+                                   pDeadband, _
+                                   hLoc.AddrOfPinnedObject(), _
+                                   hClientGroup.AddrOfPinnedObject())
+            Else
+                ' Deactivate group
+                activeGroup = False
+                hActive.Target = 0
+                m_group.SetState(hRequestedUpdateRate.AddrOfPinnedObject(), _
+                    RevisedUpdateRate, _
+                    hActive.AddrOfPinnedObject(), _
+                    pTimeBias, _
+                    pDeadband, _
+                    hLoc.AddrOfPinnedObject(), _
+                    hClientGroup.AddrOfPinnedObject())
+                ' Clear previously shown values
+                Edit_OnDataVal_0.Text = ""
+                Edit_OnDataVal_1.Text = ""
+                Edit_OnDataVal_2.Text = ""
+                Edit_OnDataVal_3.Text = ""
+                Edit_OnDataVal_4.Text = ""
+                Edit_OnDataVal_5.Text = ""
+                Edit_OnDataVal_6.Text = ""
+                Edit_OnDataVal_7.Text = ""
+                Edit_OnDataVal_8.Text = ""
+                Edit_OnDataVal_9.Text = ""
+                Edit_OnDataVal_10.Text = ""
+                Edit_OnDataVal_11.Text = ""
+
+                Edit_OnDataQu_0.Text = ""
+                Edit_OnDataQu_1.Text = ""
+                Edit_OnDataQu_2.Text = ""
+                Edit_OnDataQu_3.Text = ""
+                Edit_OnDataQu_4.Text = ""
+                Edit_OnDataQu_5.Text = ""
+                Edit_OnDataQu_6.Text = ""
+                Edit_OnDataQu_7.Text = ""
+                Edit_OnDataQu_8.Text = ""
+                Edit_OnDataQu_9.Text = ""
+                Edit_OnDataQu_10.Text = ""
+                Edit_OnDataQu_11.Text = ""
+
+                Edit_OnDataTS_0.Text = ""
+                Edit_OnDataTS_1.Text = ""
+                Edit_OnDataTS_2.Text = ""
+                Edit_OnDataTS_3.Text = ""
+                Edit_OnDataTS_4.Text = ""
+                Edit_OnDataTS_5.Text = ""
+                Edit_OnDataTS_6.Text = ""
+                Edit_OnDataTS_7.Text = ""
+                Edit_OnDataTS_8.Text = ""
+                Edit_OnDataTS_9.Text = ""
+                Edit_OnDataTS_10.Text = ""
+                Edit_OnDataTS_11.Text = ""
+            End If
+        Catch ex As Exception
+            OutText = ""
+            MessageBox.Show(OutText & Chr(13) & Chr(13) & vbCrLf & ex.ToString(), "Exception", MessageBoxButtons.OK, MessageBoxIcon.Error)
+        Finally
+            ' Free unmanaged memory
+            If hActive.IsAllocated Then hActive.Free()
+            If hLoc.IsAllocated Then hLoc.Free()
+            If hRequestedUpdateRate.IsAllocated Then hRequestedUpdateRate.Free()
+            If hClientGroup.IsAllocated Then hClientGroup.Free()
+        End Try
+    End Sub
+    Private Sub Edit_WriteVal_TextChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Edit_WriteVal.TextChanged
+        ' Clear old value
+        Command_Write.Enabled = True
+        Edit_WriteRes.Text = ""
+    End Sub
+    Private Sub Start_Sample()
+        Try
+            OutText = "Create instance of the SIMATIC NET OPC-Server"
+            ' Given a ProgID, this looks up the associated Type in the registry
+            Dim typeofOPCserver As Type = Type.GetTypeFromProgID("OPC.SimaticNET")
+            ' Create the OPC server object and querry for the IOPCServer interface of the object
+            m_server = Activator.CreateInstance(typeofOPCserver)
+            Edit_WriteVal.ReadOnly = False
+            OutText = "Adding a Group to OPC-Server"
+            Dim RevisedUpdateRate As Integer
+            Dim TimeBias As Int32 = 0
+            Dim Deadband As Double = 0
+            Dim hTimeBias As GCHandle = GCHandle.Alloc(TimeBias, GCHandleType.Pinned)
+            Dim hDeadband As GCHandle = GCHandle.Alloc(TimeBias, GCHandleType.Pinned)
+            ClientGrouphandle = 10
+            ' Add a group object "MyOPCGroup" and querry for interface IOPCItemMgt
+            ' Parameter as following:
+            ' [in] not active, so no OnDataChange callback
+            ' [in] Request this Update Rate from Server
+            ' [in] Client Handle, not necessary in this sample
+            ' [in] No time interval to system UTC time
+            ' [in] No Deadband, so all data changes are reported
+            ' [in] Server uses english language to for text values
+            ' [out] Server handle to identify this group in later calls
+            ' [out] The answer from Server to the requested Update Rate
+            ' [in] requested interface type of the group object
+            ' [out] pointer to the requested interface
+            m_server.AddGroup( _
+                    "MyOPCGroup", _
+                    0, _
+                    250, _
+                    ClientGrouphandle, _
+                    hTimeBias.AddrOfPinnedObject(), _
+                    hDeadband.AddrOfPinnedObject(), _
+                    LOCALE_ID, _
+                    ServerGroup, _
+                    RevisedUpdateRate, _
+                    GetType(IOPCGroupStateMgt).GUID, _
+                    m_group)
+            m_item = m_group
+            ' define item tables with 2 items as in parameters for AddItem
+            Dim itemdefs(MessCount) As OPCITEMDEF
+            For i = 0 To (MessCount - 1)
+                itemdefs(i) = New OPCITEMDEF
+                ' Accesspath not needed
+                itemdefs(i).szAccessPath = ""
+
+                ' AddItem Active, so OnDataChange will come in an active group for this item 
+                itemdefs(i).bActive = 1
+                ' Client handle , needed in this sample in callback OnDataChange
+                itemdefs(i).hClient = i + 1
+
+                ' "BinaryLargeOBject" not needed by SimaticNet OPC Server
+                itemdefs(i).dwBlobSize = 0
+                ' no blob
+                itemdefs(i).pBlob = IntPtr.Zero
+            Next
+            '' ' -----------0--相机准备好------------------------
+            itemdefs(0).szItemID = "S7:[S7 connection_1]DB400,X36.0"
+            itemdefs(0).vtRequestedDataType = VarEnum.VT_BOOL
+
+            '' ' -----------1--相机故障--------------------------
+            itemdefs(1).szItemID = "S7:[S7 connection_1]DB400,X36.1"
+            itemdefs(1).vtRequestedDataType = VarEnum.VT_BOOL
+
+            '' '------------2--缸体编号----------------------------
+            itemdefs(2).szItemID = "S7:[S7 connection_1]DB400,STRING4.28"
+            itemdefs(2).vtRequestedDataType = VarEnum.VT_BSTR
+
+            '' ' -----------3--缸体编号接收完成-----------------------
+            itemdefs(3).szItemID = "S7:[S7 connection_1]DB400,X36.2"
+            itemdefs(3).vtRequestedDataType = VarEnum.VT_BOOL
+
+            '' ' -----------4--缸体编号----------------------------------
+            itemdefs(4).szItemID = "S7:[S7 connection_1]DB400,STRING48.28"
+            itemdefs(4).vtRequestedDataType = VarEnum.VT_BSTR
+
+            '' '------------5--缸体编号发送完成----------------------------
+            itemdefs(5).szItemID = "S7:[S7 connection_1]DB400,X46.7"
+            itemdefs(5).vtRequestedDataType = VarEnum.VT_BOOL
+
+            '' '------------6--拍照位置----------------------------
+            itemdefs(6).szItemID = "S7:[S7 connection_1]DB400,CHAR1"
+            itemdefs(6).vtRequestedDataType = VarEnum.VT_I1
+
+            '' ' -----------7--相机启动----------------------------
+            itemdefs(7).szItemID = "S7:[S7 connection_1]DB400,X2.0"
+            itemdefs(7).vtRequestedDataType = VarEnum.VT_BOOL
+
+            '' ' -----------8--相机结果合格-----------------------------
+            itemdefs(8).szItemID = "S7:[S7 connection_1]DB400,X37.0"
+            itemdefs(8).vtRequestedDataType = VarEnum.VT_BOOL
+
+            '' ' -----------9--相机结果不合格--------------------------
+            itemdefs(9).szItemID = "S7:[S7 connection_1]DB400,X37.1"
+            itemdefs(9).vtRequestedDataType = VarEnum.VT_BOOL
+
+            '' ' -----------10--请求复位输出信号------------------------
+            itemdefs(10).szItemID = "S7:[S7 connection_1]DB400,X46.1"
+            itemdefs(10).vtRequestedDataType = VarEnum.VT_BOOL
+
+            '' ' -----------11--程序号------------------------
+            itemdefs(11).szItemID = "S7:[S7 connection_1]DB400,CHAR0"
+            itemdefs(11).vtRequestedDataType = VarEnum.VT_I1
+
+            '' ' -----------12--程序号PC--->pLC------------------------
+            itemdefs(12).szItemID = "S7:[S7 connection_1]DB400,CHAR34"
+            itemdefs(12).vtRequestedDataType = VarEnum.VT_I1
+
+            '' ' -----------13--程序号PC--->plc------------------------
+            itemdefs(13).szItemID = "S7:[S7 connection_1]DB400,CHAR35"
+            itemdefs(13).vtRequestedDataType = VarEnum.VT_I1
+            OutText = "Adding Items to the Group"
+
+            Dim Results As IntPtr = IntPtr.Zero
+            Dim pErrors As IntPtr = IntPtr.Zero
+
+            ' Adding two Items to the Group  
+            m_item.AddItems(MessCount, _
+                itemdefs, _
+                Results, _
+                pErrors)
+            'Evaluate return ErrorCodes to exclude possible Errors
+            Dim errors(MessCount) As Integer
+            Marshal.Copy(pErrors, errors, 0, MessCount)
+            Dim result As OPCITEMRESULT
+            Dim pos As IntPtr = Results
+            For i = 0 To (MessCount - 1)
+                If errors(i) = 0 Then
+                    ' First Item was added succesfully
+                    If i > 0 Then
+                        pos = New IntPtr(pos.ToInt32() + Marshal.SizeOf(GetType(OPCITEMRESULT)))
+                    End If
+                    result = Marshal.PtrToStructure(pos, GetType(OPCITEMRESULT))
+                    'ServerHandle1 = result.hServer  '-------------------------------------
+                    ServerHandle(i) = result.hServer
+                Else
+                    ' First Item was not added
+                    ' Raise Exception
+                    Dim ex As Exception = New Exception("Error while adding " & (i + 1) & "th Item")
+                    Throw ex
+                End If
+                ' Destroy indirect structure elements
+                Marshal.DestroyStructure(pos, GetType(OPCITEMRESULT))
+            Next
+            ' Free allocated COM-ressouces
+            Marshal.FreeCoTaskMem(Results)
+            Marshal.FreeCoTaskMem(pErrors)
+
+            OutText = "Adding asynchron Interface"
+            ' Query interface for async calls on group object
+            m_asyncIO2 = m_group
+
+            ' Activate Group according to Checkbox
+            activeGroup = False
+
+            ' Query interface for callbacks on group object
+            m_ConnectionContainer = m_group
+
+            OutText = "Establishing asynchronous callbacks"
+
+            ' Establish Callback for all async operations
+            m_ConnectionContainer.FindConnectionPoint(GetType(IOPCDataCallback).GUID, m_ConnectionPoint)
+
+            ' Creates a connection between the OPC servers's connection point and 
+            ' this client's sink (the callback object). 
+            m_ConnectionPoint.Advise(Me, m_dwCookie)
+
+            ' Success, enable communication
+            Command_Start.Enabled = False
+            Command_Read.Enabled = True
+            Command_Write.Enabled = True
+            Command_Exit.Enabled = True
+            chkGroupActive.Enabled = True
+            chkGroupActive.Checked = True
+        Catch ex As Exception
+            MessageBox.Show(ex.Message, OutText, MessageBoxButtons.OK, MessageBoxIcon.Error)
+        End Try
+    End Sub
+    Private Sub Stop_Sample()
+        Try
+            chkGroupActive.Checked = False
+            OutText = "Removing Objects"
+
+            ' Unadvise and remove the callback
+            m_ConnectionPoint.Unadvise(m_dwCookie)
+            Marshal.ReleaseComObject(m_ConnectionPoint)
+            m_ConnectionPoint = Nothing
+
+            ' Removes items
+            Dim pItems(MessCount) As Integer
+            ' Select item by server handle, received at AddItem
+            For i As Integer = 0 To (MessCount - 1)         '
+                Try
+                    pItems(i) = ServerHandle(i)
+                Catch ex As Exception
+                    MessageBox.Show("Stop_" & ex.ToString)
+                End Try
+            Next
+            Dim pErrors As IntPtr = IntPtr.Zero
+            m_item.RemoveItems(MessCount, _
+                        pItems, _
+                        pErrors)
+
+            'Evaluating Return ErrorCodes to exclude possible Errors
+            Dim errors(MessCount) As Integer
+            Marshal.Copy(pErrors, errors, 0, MessCount)
+            For i As Integer = 0 To (MessCount - 1)            '
+                If errors(i) = 0 Then
+                    ' First Item was deleted succesfully
+                    ServerHandle(i) = 0
+                Else
+                    ' First Item was not added
+                    ' Raise Exception
+                    Dim ex As Exception = New Exception("Error while deleting " & i.ToString & " Item")
+                    Throw ex
+                End If
+            Next
+            ' Free allocated COM-ressouces
+            Marshal.FreeCoTaskMem(pErrors)
+            ' *****************************************************
+            ' removes Group
+            ' *****************************************************
+            m_server.RemoveGroup(ServerGroup, True)
+
+            ' *****************************************************
+            ' Release all interfaces
+            ' *****************************************************
+            m_asyncIO2 = Nothing
+            m_item = Nothing
+            m_group = Nothing
+            m_server = Nothing
+            ' The Server is terminated now
+
+            ' Reset dialog
+            'Edit_ReadVal.Text = ""
+            'Edit_ReadQu.Text = ""
+            'Edit_ReadTS.Text = ""
+
+            Edit_OnDataVal_0.Text = ""
+            Edit_OnDataQu_0.Text = ""
+            Edit_OnDataTS_0.Text = ""
+
+            Edit_OnDataVal_1.Text = ""
+            Edit_OnDataQu_1.Text = ""
+            Edit_OnDataTS_1.Text = ""
+
+            Edit_WriteRes.Text = ""
+            Edit_WriteVal.Text = ""
+
+            Command_Start.Enabled = True
+            Command_Read.Enabled = False
+            Command_Write.Enabled = False
+            Command_Exit.Enabled = False
+            chkGroupActive.Enabled = False
+            Edit_WriteVal.ReadOnly = True
+        Catch ex As Exception
+            MessageBox.Show(ex.Message, OutText, MessageBoxButtons.OK, MessageBoxIcon.Error)
+        End Try
+
+        Exit Sub
+    End Sub
+    Private Sub Read_value()
+        Dim ErrorString As String
+        Try
+            OutText = "Reading Value of Item"
+            ErrorString = ""
+            Dim CancelID As Integer
+            Dim pServer(MessCount) As Integer
+            ' Select item by server handle, received at AddItem
+            For i As Integer = 0 To (MessCount - 1)
+                pServer(i) = i + 1
+            Next
+            Dim pItemValues As IntPtr = IntPtr.Zero, pErrors As IntPtr = IntPtr.Zero
+            Transaction += 1
+            m_asyncIO2.Read(MessCount, _
+                pServer, _
+                Transaction, _
+                CancelID, _
+                pErrors)
+            'check if an error occured
+            Dim errors(MessCount) As Integer
+            Marshal.Copy(pErrors, errors, 0, MessCount)
+            If errors(0) <> 0 Then
+                ' Errors occured - raise Exception
+                Dim ex As Exception = New Exception("Read Error")
+                Throw ex
+            End If
+            ' Free allocated COM-ressouces
+            Marshal.FreeCoTaskMem(pErrors)
+        Catch ex As Exception
+            If MessageBox.Show("OPC通讯异常，请重启软件？", "提示信息", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) = Windows.Forms.DialogResult.OK Then
+                Me.Close()
+            Else
+
+            End If
+            MessageBox.Show(ex.Message, OutText, MessageBoxButtons.OK, MessageBoxIcon.Error)
+        End Try
+
+        Exit Sub
+    End Sub
+    Private Sub Write_value(ByVal j As String, ByVal K As String)
+        Dim ErrorString As String
+        OutText = "Writing Value"
+        ErrorString = ""
+        Try
+            Dim phServer(1) As Integer
+            phServer(0) = CInt(K)
+            Dim phItemValues(MessCount) As Object
+            phItemValues(0) = j
+            Dim dwCancelID As Integer
+            Dim pErrors As IntPtr = IntPtr.Zero
+            Transaction += 1
+            ' Select item by server handle, received at AddItem
+            m_asyncIO2.Write(MessCount, _
+                 phServer, _
+                 phItemValues, _
+                 Transaction, _
+                 dwCancelID, _
+                 pErrors)
+            'check if an error occured
+            Dim errors(MessCount) As Integer
+            Marshal.Copy(pErrors, errors, 0, MessCount)
+            If errors(0) <> 0 Then
+                ' Errors occured - raise Exception
+                Edit_WriteRes.Text = "Bad"
+                Dim ex As Exception = New Exception("Read Error")
+                Throw ex
+            End If
+            ' Free allocated COM-ressouces
+            Marshal.FreeCoTaskMem(pErrors)
+        Catch ex As Exception
+            'MessageBox.Show(ex.Message, OutText, MessageBoxButtons.OK, MessageBoxIcon.Error)
+            Log_WriteStr(OutText & "Error" & vbCrLf & ex.ToString, Color.Red, RTBox_Err, Path_Err)
+            GC.Collect()
+        End Try
+
+    End Sub
+
+    Public Function ToDateTime(ByVal ft As OpcRcw.Da.FILETIME) As DateTime
+        'Converts FILETIME to DateTime
+        Dim High As Long = ft.dwHighDateTime
+        Dim lng As Long = (High << 32) + ft.dwLowDateTime
+        Return DateTime.FromFileTimeUtc(lng)
+    End Function
+    Private Sub OPCAsync_Load(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles MyBase.Load
+
+    End Sub
+#Region "PLC 点位数据更新  TextBox显示"
+    ' delegate is used by the UI update mechanism (see below)
+    Private Delegate Sub UpdateTextboxDelegate(ByVal ctrlTextbox As TextBox, ByVal strText As String)
+    Private Sub UpdateTextbox(ByVal ctrlTextbox As TextBox, ByVal strText As String)
+        ' can update a text box from an arbitrary thread
+        If InvokeRequired Then 'thread switch required
+            Dim handler As New UpdateTextboxDelegate(AddressOf DoUpdateTextbox)
+            Dim listArguments() As Object = {ctrlTextbox, strText}
+            BeginInvoke(handler, listArguments)
+        Else ' called from within user interface thread
+            DoUpdateTextbox(ctrlTextbox, strText)
+        End If
+    End Sub
+
+    ' can update a text box only from the user interface thread itself
+    Private Sub DoUpdateTextbox(ByVal ctrlTextbox As TextBox, ByVal strText As String)
+        ctrlTextbox.Text = strText
+    End Sub
+#End Region
+#Region "相机程序号及拍照序号数据更新 ComBox显示"
+    ' delegate is used by the UI update mechanism (see below)
+    Private Delegate Sub UpdateComboBoxDelegate(ByVal ctrlComboBox As ComboBox, ByVal strText As String)
+    Private Sub UpdateComboBox(ByVal ctrlComboBox As ComboBox, ByVal strText As String)
+        ' can update a text box from an arbitrary thread
+        If InvokeRequired Then 'thread switch required
+            Dim handler As New UpdateComboBoxDelegate(AddressOf DoUpdateComboBox)
+            Dim listArguments() As Object = {ctrlComboBox, strText}
+            BeginInvoke(handler, listArguments)
+        Else ' called from within user interface thread
+            DoUpdateComboBox(ctrlComboBox, strText)
+        End If
+    End Sub
+
+    ' can update a text box only from the user interface thread itself
+    Private Sub DoUpdateComboBox(ByVal ctrlComboBox As ComboBox, ByVal strText As String)
+        ctrlComboBox.Text = strText
+    End Sub
+#End Region
+    Dim triggerNum As Integer = 0
+
+    ' sends data update notifications.
+    Overridable Sub OnDataChange( _
+    ByVal dwTransid As Integer, _
+    ByVal hGroup As Integer, _
+    ByVal hrMasterquality As Integer, _
+    ByVal hrMastererror As Integer, _
+    ByVal dwCount As Integer, _
+    ByVal phClientItems() As Integer, _
+    ByVal pvValues() As Object, _
+    ByVal pwQualities() As Short, _
+    ByVal pftTimeStamps() As OpcRcw.Da.FILETIME, _
+    ByVal pErrors() As Integer) Implements IOPCDataCallback.OnDataChange
+         Try
+            If dwCount >= 1 Then
+                If dwCount = 14 Then
+                    If Not Convert.ToString(pvValues(2)) = "" Then
+                        Product_SN = Convert.ToString(pvValues(2))
+                        UpdateTextbox(TextBox_ProductSN, Product_SN)
+                    End If
+                    Write_value(Product_SN, 5)
+                Else
+                    If pErrors(0) = 0 Then
+                        Dim dt As DateTime = ToDateTime(pftTimeStamps(0))
+                        Select Case phClientItems(0)
+                            Case 1
+                                '' ' -----------1--相机准备好------------------------
+                                State_CameraReady = Convert.ToString(pvValues(0))          '------------------相机准备信号
+                            Case 2
+                                '' ' -----------2--相机故障--------------------------
+                            Case 3
+                                '' '------------3--缸体编号从PLC读取----------------------------
+                                If Not Convert.ToString(pvValues(0)) = "" Then
+                                    Product_SN = Convert.ToString(pvValues(0)) '----------缸体编号'----(缸体编号接收完成)-----------------
+                                    '缸体编号写入
+                                    Write_value(Product_SN, 5)
+                                    Write_value(1, 6)
+                                End If
+                                UpdateTextbox(TextBox_ProductSN, Product_SN)         '接收成功
+                                UpdateTextbox(Edit_OnDataVal_2, Convert.ToString(pvValues(0)))
+                                UpdateTextbox(Edit_OnDataQu_2, GetQualityText(pwQualities(0)))
+                                UpdateTextbox(Edit_OnDataTS_2, Convert.ToString(dt))
+                            Case 4
+                                '' ' -----------4--缸体编号接收完成-----------------------
+                            Case 5
+                                '' ' -----------5--缸体编号写入PLC-----------------------
+                            Case 6
+                                '' ' -----------6--缸体编号写入PLC完成-----------------------
+                            Case 7
+                                ' '' '------------7--当前拍照位置----------------------------
+                                TrigerIndex = Convert.ToString(pvValues(0))
+                                UpdateTextbox(TextBox_TrigerID, TrigerIndex)   '当前拍照序号
+                                If TrigerIndex <> "0" Then
+                                    triggerNum = CInt(TrigerIndex)
+                                    Dim thread As New Thread(AddressOf SZM_Run)
+                                    thread.Start(TrigerIndex)
+                                End If
+
+                                'CCD_Run(CInt(TrigerIndex))
+                                'Write_value(c, 14)
+                                GC.Collect()
+                                'UpdateTextbox(Edit_OnDataVal_6, Convert.ToString(pvValues(0)))
+                                'UpdateTextbox(Edit_OnDataQu_6, GetQualityText(pwQualities(0)))
+                                'UpdateTextbox(Edit_OnDataTS_6, Convert.ToString(dt))
+                            Case 8
+                                '' ' -----------8--相机启动----------------------------
+                                'UpdateTextbox(Edit_OnDataVal_7, Convert.ToString(pvValues(0)))
+                                'UpdateTextbox(Edit_OnDataQu_7, GetQualityText(pwQualities(0)))
+                                'UpdateTextbox(Edit_OnDataTS_7, Convert.ToString(dt))
+                            Case 9
+                                '' ' -----------9--相机结果合格-----------------------------
+                            Case 10
+                                '' ' -----------10--相机结果不合格--------------------------
+                            Case 11
+                                '' ' -----------11--请求复位输出信号------------------------
+                            Case 12
+                                '' ' -----------12--程序号------------------------
+                                Current_ProductID = pvValues(0)
+                                If Current_ProductID = ComboBox_ProductID.Text Then
+                                    Write_value(pvValues(0), 13) '-----chengxuhao 
+                                Else
+                                    chkGroupActive.Enabled = False
+                                    UpdateComboBox(ComboBox_ProductID, pvValues(0))
+                                    Write_value(pvValues(0), 13) '-----chengxuhao 
+                                    chkGroupActive.Enabled = True
+                                End If
+                            Case 13
+                                '' ' -----------13--程序号------------------------
+                            Case 14
+                                '' ' -----------14--paizhaoxuhao ------------------------
+                        End Select
+                    End If
+                End If
+
+            Else
+                Dim ErrorString As String = "Read Error"
+                MsgBox(ErrorString, MsgBoxStyle.Critical, "Error AsyncReadComplete()")
+            End If
+        Catch e As Exception
+            Dim msg As String = e.Message
+            MsgBox(msg, MsgBoxStyle.Critical)
+        End Try
+    End Sub
+    'sends read complete notifications.
+    Overridable Sub OnReadComplete( _
+    ByVal dwTransid As Integer, _
+    ByVal hGroup As Integer, _
+    ByVal hrMasterquality As Integer, _
+    ByVal hrMastererror As Integer, _
+    ByVal dwCount As Integer, _
+    ByVal phClientItems() As Integer, _
+    ByVal pvValues() As Object, _
+    ByVal pwQualities() As Short, _
+    ByVal pftTimeStamps() As OpcRcw.Da.FILETIME, _
+    ByVal pErrors() As Integer) Implements OpcRcw.Da.IOPCDataCallback.OnReadComplete
+        Try
+            For i As Integer = 1 To dwCount
+                If pErrors(i - 1) = 0 Then
+                    Dim dt As DateTime = ToDateTime(pftTimeStamps(i - 1))
+                    If phClientItems(i - 1) = i Then
+                        Select Case i
+                            Case 1
+                                '' ' -----------1--相机准备好------------------------
+                                UpdateTextbox(Edit_OnDataVal_0, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_0, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_0, Convert.ToString(dt))
+                            Case 2
+                                '' ' -----------2--相机故障--------------------------
+                                UpdateTextbox(Edit_OnDataVal_1, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_1, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_1, Convert.ToString(dt))
+                            Case 3
+                                '' '------------3--缸体编号从PLC读取----------------------------
+                                Product_SN = Convert.ToString(pvValues(i - 1)) '----------缸体编号'----(缸体编号接收完成)-----------------
+                                Write_value(Product_SN, 5)                            '缸体编号写入
+                                UpdateTextbox(TextBox_ProductSN, Product_SN)         '接收成功
+                                UpdateTextbox(Edit_OnDataVal_2, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_2, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_2, Convert.ToString(dt))
+                            Case 4
+                                '' ' -----------4--缸体编号接收完成-----------------------
+                                UpdateTextbox(Edit_OnDataVal_3, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_3, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_3, Convert.ToString(dt))
+                            Case 5
+                                '' ' -----------5--缸体编号写入PLC-----------------------
+                                UpdateTextbox(Edit_OnDataVal_4, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_4, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_4, Convert.ToString(dt))
+                            Case 6
+                                '' ' -----------6--缸体编号写入PLC完成-----------------------
+                                UpdateTextbox(Edit_OnDataVal_5, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_5, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_5, Convert.ToString(dt))
+                            Case 7
+                                ' '' '------------7--当前拍照位置----------------------------
+                                TrigerIndex = Convert.ToString(pvValues(i - 1))
+                                UpdateTextbox(TextBox_TrigerID, TrigerIndex)   '当前拍照序号
+                                Write_value(TrigerIndex, 14)
+                                UpdateTextbox(Edit_OnDataVal_6, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_6, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_6, Convert.ToString(dt))
+                            Case 8
+                                '' ' -----------8--相机启动----------------------------
+                                UpdateTextbox(Edit_OnDataVal_7, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_7, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_7, Convert.ToString(dt))
+                            Case 9
+                                '' ' -----------9--相机结果合格-----------------------------
+                                UpdateTextbox(Edit_OnDataVal_8, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_8, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_8, Convert.ToString(dt))
+                            Case 10
+                                '' ' -----------10--相机结果不合格--------------------------
+                                UpdateTextbox(Edit_OnDataVal_9, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_9, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_9, Convert.ToString(dt))
+                            Case 11
+                                '' ' -----------11--请求复位输出信号------------------------
+                                UpdateTextbox(Edit_OnDataVal_10, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_10, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_10, Convert.ToString(dt))
+                            Case 12
+                                '' ' -----------12--程序号------------------------
+                                UpdateTextbox(Edit_OnDataVal_11, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_11, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_11, Convert.ToString(dt))
+                            Case 13
+                                '' ' -----------13--程序号------------------------
+                                UpdateTextbox(Edit_OnDataVal_11, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_11, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_11, Convert.ToString(dt))
+                            Case 14
+                                '' ' -----------14--paizhaoxuhao ------------------------
+                                UpdateTextbox(Edit_OnDataVal_11, Convert.ToString(pvValues(i - 1)))
+                                UpdateTextbox(Edit_OnDataQu_11, GetQualityText(pwQualities(i - 1)))
+                                UpdateTextbox(Edit_OnDataTS_11, Convert.ToString(dt))
+                        End Select
+                    End If
+                Else
+                    Dim ErrorString As String = "Read Error "
+                    MsgBox(ErrorString, MsgBoxStyle.Critical, "Error AsyncReadComplete()")
+                End If
+            Next
+        Catch e As Exception
+            Dim msg As String = e.Message
+            MsgBox(msg, MsgBoxStyle.Critical)
+        End Try
+    End Sub
+    ' handles asynchronous write complete events.
+    Overridable Sub OnWriteComplete( _
+    ByVal dwTransid As Integer, _
+    ByVal hGroup As Integer, _
+    ByVal hrMastererror As Integer, _
+    ByVal dwCount As Integer, _
+    ByVal phClientItems() As Integer, _
+    ByVal pErrors() As Integer) Implements IOPCDataCallback.OnWriteComplete
+        Try
+            Dim ErrorStr As String = ""
+            'If dwCount = 1 Then
+            '    m_server.GetErrorString(pErrors(0), LOCALE_ID, ErrorStr)
+            '    UpdateTextbox(Edit_WriteRes, ErrorStr)
+            'End If
+        Catch e As Exception
+            Dim msg As String = e.Message
+            MsgBox(msg, MsgBoxStyle.Critical)
+        End Try
+    End Sub
+    ' handles asynchronous request cancel events.
+    Public Sub OnCancelComplete( _
+            ByVal dwTransid As Integer, _
+            ByVal inthGroup As Integer) Implements IOPCDataCallback.OnCancelComplete
+        ' This routine has to be present, although not used in this sample
+    End Sub
+
+    Private Function GetQualityText(ByVal qnr As Integer) As String
+        'Const OPC_QUALITY_MASK As Short = &HC0
+        'Const OPC_STATUS_MASK As Short = &HFC
+        'Const OPC_LIMIT_MASK As Short = &H3
+        Const OPC_QUALITY_BAD As Short = &H0
+        Const OPC_QUALITY_UNCERTAIN As Short = &H40
+        Const OPC_QUALITY_GOOD As Short = &HC0
+        Const OPC_QUALITY_CONFIG_ERROR As Short = &H4
+        Const OPC_QUALITY_NOT_CONNECTED As Short = &H8
+        Const OPC_QUALITY_DEVICE_FAILURE As Short = &HC
+        Const OPC_QUALITY_SENSOR_FAILURE As Short = &H10
+        Const OPC_QUALITY_LAST_KNOWN As Short = &H14
+        Const OPC_QUALITY_COMM_FAILURE As Short = &H18
+        Const OPC_QUALITY_OUT_OF_SERVICE As Short = &H1C
+        Const OPC_QUALITY_LAST_USABLE As Short = &H44
+        Const OPC_QUALITY_SENSOR_CAL As Short = &H50
+        Const OPC_QUALITY_EGU_EXCEEDED As Short = &H54
+        Const OPC_QUALITY_SUB_NORMAL As Short = &H58
+        Const OPC_QUALITY_LOCAL_OVERRIDE As Short = &HD8
+        'Const OPC_LIMIT_OK As Short = &H0
+        'Const OPC_LIMIT_LOW As Short = &H1
+        'Const OPC_LIMIT_HIGH As Short = &H2
+        'Const OPC_LIMIT_CONST As Short = &H3
+
+        Dim qstr As String = ""
+
+        Select Case qnr
+
+            Case OPC_QUALITY_BAD
+                qstr = "BAD"
+            Case OPC_QUALITY_UNCERTAIN
+                qstr = "UNCERTAIN"
+            Case OPC_QUALITY_GOOD
+                qstr = "GOOD"
+            Case OPC_QUALITY_CONFIG_ERROR
+                qstr = "CONFIG_ERROR"
+            Case OPC_QUALITY_NOT_CONNECTED
+                qstr = "NOT_CONNECTED"
+            Case OPC_QUALITY_DEVICE_FAILURE
+                qstr = "DEVICE_FAILURE"
+            Case OPC_QUALITY_SENSOR_FAILURE
+                qstr = "SENSOR_FAILURE"
+            Case OPC_QUALITY_LAST_KNOWN
+                qstr = "LAST_KNOWN"
+            Case OPC_QUALITY_COMM_FAILURE
+                qstr = "COMM_FAILURE"
+            Case OPC_QUALITY_OUT_OF_SERVICE
+                qstr = "OUT_OF_SERVICE"
+            Case OPC_QUALITY_LAST_USABLE
+                qstr = "LAST_USABLE"
+            Case OPC_QUALITY_SENSOR_CAL
+                qstr = "SENSOR_CAL"
+            Case OPC_QUALITY_EGU_EXCEEDED
+                qstr = "EGU_EXCEEDED"
+            Case OPC_QUALITY_SUB_NORMAL
+                qstr = "SUB_NORMAL"
+            Case OPC_QUALITY_LOCAL_OVERRIDE
+                qstr = "LOCAL_OVERRIDE"
+            Case Else
+                qstr = "UNKNOWN ERROR"
+        End Select
+        Return qstr
+    End Function
+#End Region
+
+#Region "相机拍照运行"
+    Delegate Sub SZMRunDel(ByVal index As Integer)
+    Private Sub SZM_Run(ByVal index As Integer)
+        Try
+
+            If InvokeRequired Then
+                Dim mydel As New SZMRunDel(AddressOf SZM_Run)
+                Invoke(mydel, index)
+                Return
+            End If
+            TimeStop()
+            CCD_Run(index)
+            Write_value(index, 14)
+
+            If index < 8 And index > 0 Then
+                TimeStart()
+            End If
+
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+                           
+#End Region
+#Region "清除计数"
+    Private Sub Btn_Reset_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Btn_Reset.Click
+        Count_OK = 0
+        Count_Total = 0
+        TextBox_OK.Text = "0"
+        TextBox_NG.Text = "0"
+        TextBox_Total.Text = "0"
+        TextBox_Pass_.Text = "0"
+        Save_CCD_Data()
+    End Sub
+#End Region
+#Region "图片"
+    Private Shared Function GetCodecInfo(ByVal mimeType As String) As ImageCodecInfo
+        Dim CodecInfo() As ImageCodecInfo = ImageCodecInfo.GetImageEncoders()
+        For Each ici As ImageCodecInfo In CodecInfo
+
+            If ici.MimeType = mimeType Then
+                Return ici
+            End If
+        Next
+        Return Nothing
+    End Function
+    Private Shared Function KiSaveAsJPEG(ByVal bmp As Bitmap, ByVal filename As String, ByVal Qty As Integer) As Boolean
+        Try
+            Dim p As EncoderParameter
+            Dim ps As EncoderParameters
+            ps = New EncoderParameters(1)
+            p = New EncoderParameter(System.Drawing.Imaging.Encoder.Quality, Qty)
+            ps.Param.SetValue(p, 0)
+            bmp.Save(filename, GetCodecInfo("image/jpeg"), ps)
+            Return True
+        Catch ex As Exception
+            Return False
+        End Try
+    End Function
+    Private Sub Save_OK_Image(ByVal Image1 As CogImage8Grey)
+        Try
+            Dim fname As String
+            fname = Path_SaveImage_OK & "\" & Current_ProductID.ToString & "\" + Format(Now, "yyyy年M月d日")
+            If Dir(fname, vbDirectory) = "" Then '判断文件夹是否存在   
+                MkDir(fname)                     '创建文件夹         
+            End If
+            fname = fname + "\" + Product_SN + ".jpg"
+            KiSaveAsJPEG(Image1.ToBitmap, fname, 20)
+            'Dim imagefileWrite As New CogImageFile
+            'imagefileWrite.Open(fname, CogImageFileModeConstants.Update)
+            'imagefileWrite.Append(Image1)
+
+        Catch ex As Exception
+            MessageBox.Show("OK图片保存异常")
+        End Try
+    End Sub
+    Private Sub Save_NG_Image(ByVal Image1 As CogImage8Grey)
+        Try
+            Dim fname As String
+            fname = Path_SaveImage_NG & "\" & Current_ProductID.ToString & "\" + Format(Now, "yyyy年M月d日")
+            If Dir(fname, vbDirectory) = "" Then '判断文件夹是否存在   
+                MkDir(fname)                     '创建文件夹         
+            End If
+            fname = fname + "\" + Product_SN + ".jpg"
+            KiSaveAsJPEG(Image1.ToBitmap, fname, 20)
+            'Dim imagefileWrite As New CogImageFile
+            'imagefileWrite.Open(fname, CogImageFileModeConstants.Update)
+            'imagefileWrite.Append(Image1)
+
+        Catch ex As Exception
+            MessageBox.Show("NG图片保存异常")
+        End Try
+    End Sub
+    Private Sub Save_Image()
+        Try
+            If isSaveOriImage = True Then
+                Dim fname As String
+                fname = "D:\MVision_Image\Test"
+                If Dir(fname, vbDirectory) = "" Then '判断文件夹是否存在   
+                    MkDir(fname)                     '创建文件夹         
+                End If
+                fname = fname + "\" + Product_SN.ToString + "\" + TextBox_TrigerID.Text + ".bmp"
+
+                Dim imagefileWrite As New CogImageFile
+                imagefileWrite.Open(fname, CogImageFileModeConstants.Write)
+                imagefileWrite.Append(CogRecordDisplay1.Image)
+            End If
+
+        Catch ex As Exception
+            MessageBox.Show("NG图片保存异常")
+        End Try
+    End Sub
+#End Region
+#Region "CCD操作"
+    Private Sub CCD_Live_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles CCD_Live.Click
+        If CCD_Live.Text = "Live" Then
+            Try
+                CogRecordDisplay1.StaticGraphics.Clear()
+                CogRecordDisplay1.InteractiveGraphics.Clear()
+                CogRecordDisplay1.StartLiveDisplay(mCamera(0).Operator)
+                CogRecordDisplay1.Fit(True)
+                CCD_Live.Text = "Stop"
+                CCD_Live.BackColor = Color.Red
+            Catch ex As Exception
+                MessageBox.Show("实时开启失败")
+            End Try
+        Else
+            Try
+                CogRecordDisplay1.StopLiveDisplay()
+                CogRecordDisplay1.Image = Nothing
+                CCD_Live.Text = "Live"
+                CCD_Live.BackColor = Color.LightGray
+            Catch ex As Exception
+                MessageBox.Show("实时关闭失败")
+            End Try
+        End If
+    End Sub
+    Private Sub Btn_TrigerCamera_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Btn_TrigerCamera.Click
+        Try
+            mCamera(0).Run()
+            CogRecordDisplay1.InteractiveGraphics.Clear()
+            CogRecordDisplay1.Image = mCamera(CInt(0)).OutputImage
+        Catch ex As Exception
+            MessageBox.Show("CCD取像失败")
+        End Try
+    End Sub
+    Private Sub Run_Once_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Run_Once.Click
+        Try
+            mToolBlock.Run()
+        Catch ex As Exception
+            MessageBox.Show("CCD运行失败")
+        End Try
+    End Sub
+    Private Sub Open_Image_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Open_Image.Click
+        Try
+            'OpenFileDialog1.InitialDirectory = Fname_ImageFile ''OpenFileDialog1.InitialDirectory
+            If Dir(Path_SaveImage_NG, vbDirectory) = "" Then '判断文件夹是否存在
+                MkDir(Path_SaveImage_NG)                     '创建文件夹        
+            End If
+            Dim open_D As New OpenFileDialog
+            open_D.InitialDirectory = Path_SaveImage_NG
+            If open_D.ShowDialog() <> Windows.Forms.DialogResult.Cancel Then
+                saveimage.Checked = False
+                Dim ImageFile1 As New CogImageFileTool
+                ImageFile1.Operator.Open(open_D.FileName, CogImageFileModeConstants.Read)
+                ImageFile1.Run()
+                mToolBlock.Inputs.Item("Input").Value = ImageFile1.OutputImage
+                mToolBlock.Run()
+                ImageFile1.Dispose()
+                saveimage.Checked = True
+            End If
+        Catch ex As Exception
+            MessageBox.Show("打开ImageFile文件失败")
+        End Try
+    End Sub
+    Private Sub Btn_SaveAll_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Btn_SaveAll.Click
+        Try
+            Save_CCD_Data()
+            Log_WriteStr("Camera文件及参数保存成功", Color.Green, RTBox_Log, Path_Log)
+            MessageBox.Show("Camera文件及参数保存成功")
+        Catch ex As Exception
+            Log_WriteStr("Camera文件及参数保存成功", Color.Red, RTBox_Err, Path_Err)
+        End Try
+    End Sub
+#End Region
+#Region "料号切换"
+    Private Sub ComboBox1_SelectedIndexChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles ComboBox_ProductID.SelectedIndexChanged
+        VPP_Load()
+    End Sub
+#End Region
+    Dim isSaveImage As Boolean = False
+    Private Sub saveimage_CheckedChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles saveimage.CheckedChanged
+        Try
+
+            If saveimage.CheckState = CheckState.Checked Then
+                isSaveImage = True
+            Else
+                isSaveImage = False
+            End If
+
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+    Dim isSaveOriImage As Boolean = False
+    Private Sub Original_Image_CheckedChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Original_Image.CheckedChanged
+        Try
+
+            If Original_Image.CheckState = CheckState.Checked Then
+                isSaveOriImage = True
+            Else
+                isSaveOriImage = False
+            End If
+
+        Catch ex As Exception
+            MessageBox.Show(ex.ToString)
+        End Try
+    End Sub
+End Class
